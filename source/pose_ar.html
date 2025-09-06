@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>WebXR AR Pose Sender</title>
+  <style>
+    body { margin: 0; overflow: hidden; font-family: system-ui, Arial; }
+    #startButton {
+      position: absolute; left:50%; top:50%; transform:translate(-50%,-50%);
+      padding: 12px 18px; font-size:16px; z-index: 20;
+      border-radius:8px; border: none; background: #056cf2; color: white;
+    }
+    #debug {
+      position: absolute; left: 10px; bottom: 10px;
+      background: rgba(0,0,0,0.6); color: #fff; padding: 8px; border-radius: 6px;
+      font-size: 13px; z-index: 30; max-width: 46vw;
+      white-space: pre-line;
+    }
+    canvas { display:block; }
+  </style>
+</head>
+<body>
+  <button id="startButton">Start AR</button>
+  <div id="debug">Status: idle</div>
+
+  <script type="module">
+  import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.162.0/build/three.module.js';
+  import { ARButton } from 'https://cdn.jsdelivr.net/npm/three@0.162.0/examples/jsm/webxr/ARButton.js';
+
+  // ========= CONFIG =========
+  const WS_URL = "wss://baseball-might-liverpool-fixed.trycloudflare.com"; // your cloudflared wss url
+  const MAX_HZ = 30;
+  const CLIENT_ID = Math.random().toString(36).substring(2, 9);
+  // ==========================
+
+  const debug = document.getElementById("debug");
+  const startButton = document.getElementById("startButton");
+  const setDebug = (msg) => { debug.innerText = msg; console.log(msg); };
+
+  // Three.js setup
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(70, window.innerWidth/window.innerHeight, 0.01, 20);
+  const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.xr.enabled = true;
+  document.body.appendChild(renderer.domElement);
+
+  // Add a cube in the world so you can confirm positional movement
+  const cube = new THREE.Mesh(
+    new THREE.BoxGeometry(0.2, 0.2, 0.2),
+    new THREE.MeshNormalMaterial()
+  );
+  cube.position.set(0, 0, -1); // 1m forward
+  scene.add(cube);
+
+  // WebSocket state
+  let socket, socketOpen = false;
+  let refSpace = null;
+  let lastSend = 0;
+  const minInterval = 1.0 / MAX_HZ;
+
+  function openSocket() {
+    if (!WS_URL.startsWith("wss://")) {
+      setDebug("WS_URL not configured or not secure.");
+      return;
+    }
+    socket = new WebSocket(WS_URL);
+    socket.onopen = () => { socketOpen = true; setDebug("WebSocket connected"); };
+    socket.onclose = () => { socketOpen = false; setDebug("WebSocket closed"); };
+    socket.onerror = (e) => { console.warn("WS error", e); setDebug("WebSocket error"); };
+    socket.onmessage = (m) => console.log("Server:", m.data);
+  }
+
+  function sendPose(xrFrame) {
+    if (!socketOpen || !refSpace) return;
+    const now = performance.now() / 1000;
+    if (now - lastSend < minInterval) return;
+    const pose = xrFrame.getViewerPose(refSpace);
+    if (!pose) return;
+    const t = pose.transform;
+    const msg = {
+      clientId: CLIENT_ID,
+      ts: Date.now(),
+      position: { x: t.position.x, y: t.position.y, z: t.position.z },
+      rotation: { x: t.orientation.x, y: t.orientation.y, z: t.orientation.z, w: t.orientation.w },
+    };
+    try { socket.send(JSON.stringify(msg)); lastSend = now; } catch {}
+  }
+
+  function onXRFrame(t, xrFrame) {
+    cube.rotation.x += 0.01;
+    cube.rotation.y += 0.01;
+    renderer.render(scene, camera);
+    sendPose(xrFrame);
+  }
+
+  // Session start
+  renderer.xr.addEventListener("sessionstart", async () => {
+    const session = renderer.xr.getSession();
+    setDebug("XR session started. Requesting reference space...");
+    try {
+      refSpace = await session.requestReferenceSpace("local-floor")
+                 .catch(() => session.requestReferenceSpace("local"));
+      if (!refSpace) {
+        setDebug("Only orientation tracking available (no x,y,z).");
+      } else {
+        setDebug("Reference space acquired. Starting AR + socket.");
+      }
+      openSocket();
+      renderer.setAnimationLoop(onXRFrame);
+    } catch (e) {
+      setDebug("Reference space error: " + e.message);
+    }
+  });
+
+  renderer.xr.addEventListener("sessionend", () => {
+    setDebug("XR session ended.");
+    renderer.setAnimationLoop(null);
+    refSpace = null;
+  });
+
+  startButton.addEventListener("click", async () => {
+    startButton.style.display = "none";
+    if (!navigator.xr) {
+      setDebug("WebXR not supported in this browser.");
+      return;
+    }
+    const supported = await navigator.xr.isSessionSupported("immersive-ar");
+    if (!supported) {
+      setDebug("immersive-ar not supported on this device.");
+      return;
+    }
+    // Add ARButton (will request camera permission)
+    document.body.appendChild(
+      ARButton.createButton(renderer, { requiredFeatures: ["local-floor"] })
+    );
+    setDebug("Press 'Enter AR' to start.");
+  });
+
+  window.addEventListener("resize", () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+  </script>
+</body>
+</html>
