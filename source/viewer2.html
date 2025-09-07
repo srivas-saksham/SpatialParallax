@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Depth Photo — Safe Parallax Controls</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    html,body { height:100%; margin:0; background:#000; overflow:hidden; }
+    #controls {
+      position: absolute;
+      left: 12px; top: 12px;
+      background: rgba(0,0,0,0.65);
+      color: #fff; padding: 10px; border-radius: 8px;
+      font-family: monospace; font-size:13px; z-index:40;
+      user-select:none;
+    }
+    #controls label { display:block; margin-bottom:8px; }
+    input[type=range] { width:180px; }
+    #debug {
+      position: absolute; right: 12px; bottom: 12px;
+      background: rgba(0,0,0,0.65);
+      color:#fff; padding:8px 10px; border-radius:8px;
+      font-family: monospace; font-size:13px; white-space:pre;
+      z-index:40;
+    }
+    button { cursor:pointer; }
+  </style>
+</head>
+<body>
+  <div id="controls">
+    <label>
+      Strength: <span id="strengthVal">0.6</span><br/>
+      <input id="strengthSlider" type="range" min="0.0" max="2.0" step="0.01" value="0.6">
+    </label>
+
+    <label>
+      Sensitivity: <span id="sensVal">1.0</span><br/>
+      <input id="sensSlider" type="range" min="0.0" max="4.0" step="0.01" value="1.0">
+    </label>
+
+    <div style="margin-top:8px;">
+      <button id="calBtn">Calibrate (reset neutral pose)</button>
+    </div>
+  </div>
+
+  <div id="debug">loading textures…</div>
+
+  <script type="module">
+  import * as THREE from 'https://unpkg.com/three@0.159.0/build/three.module.js';
+
+  // ---------- basic scene ----------
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.01, 100);
+  camera.position.set(0,0,0.5);
+
+  const renderer = new THREE.WebGLRenderer({ antialias:true });
+  renderer.setSize(innerWidth, innerHeight);
+  renderer.setPixelRatio(window.devicePixelRatio || 1);
+  document.body.appendChild(renderer.domElement);
+
+  const debug = document.getElementById('debug');
+
+  // ---------- UI ----------
+  const strengthSlider = document.getElementById('strengthSlider');
+  const strengthVal = document.getElementById('strengthVal');
+  const sensSlider = document.getElementById('sensSlider');
+  const sensVal = document.getElementById('sensVal');
+  const calBtn = document.getElementById('calBtn');
+
+  strengthVal.textContent = strengthSlider.value;
+  sensVal.textContent = sensSlider.value;
+
+  // ---------- parameters ----------
+  // MAX_UV_SHIFT: maximum absolute shift in UV units (safeguard).
+  // keep small — values are fractional (0.05 means 5% of texture dimension).
+  const MAX_UV_SHIFT = 0.12;
+
+  let sensitivity = parseFloat(sensSlider.value);
+  let strength = parseFloat(strengthSlider.value);
+
+  strengthSlider.addEventListener('input', () => {
+    strength = parseFloat(strengthSlider.value);
+    strengthVal.textContent = strengthSlider.value;
+    if (shaderMat) shaderMat.uniforms.strength.value = strength;
+  });
+
+  sensSlider.addEventListener('input', () => {
+    sensitivity = parseFloat(sensSlider.value);
+    sensVal.textContent = sensSlider.value;
+  });
+
+  // Calibration: set neutral pose (first pose or when button pressed)
+  let neutralPose = null;
+  calBtn.addEventListener('click', () => {
+    if (latestPose) {
+      neutralPose = { x: latestPose.x, y: latestPose.y, z: latestPose.z };
+      console.log('Neutral pose set:', neutralPose);
+    }
+  });
+
+  // ---------- textures & plane (created only when textures loaded) ----------
+  const loader = new THREE.TextureLoader();
+  loader.setCrossOrigin('anonymous');
+
+  let photoTex = null;
+  let depthTex = null;
+  let shaderMat = null;
+  let plane = null;
+
+  // helper to initialize when both textures loaded
+  function tryCreatePlane() {
+    if (!photoTex || !depthTex) return;
+
+    // ensure clamping & linear filtering (safer)
+    [photoTex, depthTex].forEach(t => {
+      t.minFilter = THREE.LinearFilter;
+      t.magFilter = THREE.LinearFilter;
+      t.wrapS = THREE.ClampToEdgeWrapping;
+      t.wrapT = THREE.ClampToEdgeWrapping;
+    });
+
+    // compute aspect and build plane geometry to preserve aspect
+    const aspect = (photoTex.image && photoTex.image.width && photoTex.image.height)
+      ? (photoTex.image.width / photoTex.image.height)
+      : (16/9);
+
+    // shader material
+    shaderMat = new THREE.ShaderMaterial({
+      uniforms: {
+        photo: { value: photoTex },
+        depthMap: { value: depthTex },
+        headOffset: { value: new THREE.Vector2(0.0, 0.0) },
+        strength: { value: strength }
+      },
+      vertexShader: `
+        varying vec2 vUv;
+        void main(){
+          vUv = uv;
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0);
+        }
+      `,
+      fragmentShader: `
+        precision highp float;
+        varying vec2 vUv;
+        uniform sampler2D photo;
+        uniform sampler2D depthMap;
+        uniform vec2 headOffset;
+        uniform float strength;
+
+        void main(){
+          // read depth (assumed 0..1)
+          float d = texture2D(depthMap, vUv).r;
+
+          // compute per-pixel displacement
+          // headOffset is small (e.g. ±0.05), strength scales depth influence.
+          vec2 shifted = vUv + headOffset * (1.0 - d) * strength;
+
+          // clamp to avoid sampling outside texture (prevents artifacts)
+          shifted = clamp(shifted, vec2(0.0001), vec2(0.9999));
+
+          vec4 col = texture2D(photo, shifted);
+          gl_FragColor = col;
+        }
+      `,
+      transparent: false
+    });
+
+    // create plane sized to image aspect; base height = 2 units (same earlier)
+    const width = 2 * aspect;
+    const height = 2;
+    const geometry = new THREE.PlaneGeometry(width, height);
+    plane = new THREE.Mesh(geometry, shaderMat);
+    plane.position.z = -2; // move back so camera is in front
+    scene.add(plane);
+
+    debug.textContent = 'ready — waiting for pose…\n(press "Calibrate" to set neutral pose)';
+  }
+
+  // load textures (use onLoad callbacks to get image size)
+  loader.load('chair.jpg', tex => { photoTex = tex; tryCreatePlane(); }, undefined, e => { console.error('photo load err', e); debug.textContent='photo load error'; });
+  loader.load('chair_depthmap.png', tex => { depthTex = tex; tryCreatePlane(); }, undefined, e => { console.error('depth load err', e); debug.textContent='depth load error'; });
+
+  // ---------- pose websocket ----------
+  let latestPose = null;
+  const WS = 'wss://date-males-terminals-ron.trycloudflare.com'; // change as needed
+  let ws;
+  try {
+    ws = new WebSocket(WS);
+    ws.onopen = () => console.log('ws open');
+    ws.onerror = (e) => console.warn('ws error', e);
+    ws.onmessage = (ev) => {
+      try {
+        const d = JSON.parse(ev.data);
+        if (d && d.position) {
+          // data expected { position: {x,y,z}, rotation: {...}, ... }
+          latestPose = d.position;
+          // set neutral if not set
+          if (!neutralPose) {
+            neutralPose = { x: latestPose.x, y: latestPose.y, z: latestPose.z };
+            console.log('neutral auto-set to first pose', neutralPose);
+          }
+        }
+      } catch (err) { /* ignore parse errors */ }
+    };
+  } catch (e) {
+    console.warn('WebSocket failed to open', e);
+    debug.textContent = 'WebSocket failed: ' + e.message;
+  }
+
+  // ---------- fallback: mouse control (for desktop testing) ----------
+  // Move mouse to emulate small head motion when websocket not available.
+  let mouseSim = { x:0, y:0 };
+  window.addEventListener('mousemove', (ev) => {
+    // center-based [-0.5 .. +0.5]
+    mouseSim.x = (ev.clientX / innerWidth) - 0.5;
+    mouseSim.y = (ev.clientY / innerHeight) - 0.5;
+  });
+
+  // ---------- render loop ----------
+  function animate() {
+    requestAnimationFrame(animate);
+
+    // update offset if plane and shader ready
+    if (shaderMat && plane) {
+      // use latestPose if available, else use mouseSim as small sim
+      let dx = 0, dy = 0;
+      if (latestPose && neutralPose) {
+        dx = latestPose.x - neutralPose.x;
+        dy = latestPose.y - neutralPose.y;
+      } else {
+        // emulate with mouse: multiply mouse by small factor
+        dx = -mouseSim.x * 0.15; // invert X so right-move produces natural parallax
+        dy = mouseSim.y * 0.15;
+      }
+
+      // convert meters -> UV units safely: use sensitivity and MAX_UV_SHIFT cap
+      // negative dx so camera right => texture moves left (natural)
+      let offsetX = -dx * sensitivity * 1.0; // raw
+      let offsetY = -dy * sensitivity * 1.0;
+
+      // clamp to allowed UV-shift range
+      offsetX = THREE.MathUtils.clamp(offsetX, -MAX_UV_SHIFT, MAX_UV_SHIFT);
+      offsetY = THREE.MathUtils.clamp(offsetY, -MAX_UV_SHIFT, MAX_UV_SHIFT);
+
+      // write to shader uniform (Vector2)
+      shaderMat.uniforms.headOffset.value.set(offsetX, offsetY);
+
+      // keep shader strength in sync (in case slider changed before textures loaded)
+      shaderMat.uniforms.strength.value = strength;
+
+      // debug info
+      debug.textContent =
+        `offset UV = (${offsetX.toFixed(4)}, ${offsetY.toFixed(4)})\n` +
+        `strength = ${strength.toFixed(2)}\n` +
+        `sensitivity = ${sensitivity.toFixed(2)}\n` +
+        (neutralPose ? 'neutral set' : 'neutral not set (auto using mouse until pose arrives)');
+    }
+
+    renderer.render(scene, camera);
+  }
+  animate();
+
+  // keep canvas sized
+  window.addEventListener('resize', () => {
+    camera.aspect = innerWidth / innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth, innerHeight);
+  });
+
+  </script>
+</body>
+</html>
