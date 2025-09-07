@@ -332,7 +332,7 @@ POSE_HTML = """<!doctype html>
     const msg = {
       clientId: CLIENT_ID,
       ts: Date.now(),
-      position: { x: t.position.x, y: t.position.y, z: t.position.z },
+      position: { x: t.position.x, y: t.position.y, z: t.position.z + 1.0},
       rotation: { x: t.orientation.x, y: t.orientation.y, z: t.orientation.z, w: t.orientation.w },
     };
     
